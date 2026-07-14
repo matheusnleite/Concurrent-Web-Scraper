@@ -1,0 +1,9 @@
+https://www.google.com/
+https://example.com/
+https://github.com/
+https://httpbin.org/status/404
+https://httpbin.org/status/500
+https://httpbin.org/delay/5
+https://this-domain-does-not-exist-xyz12345.com/
+not-a-valid-url
+https://httpbin.org/status/403
