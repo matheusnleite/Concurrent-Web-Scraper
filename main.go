@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
@@ -56,43 +58,56 @@ func readFile(filePath string) []string {
 	return urls
 }
 
-func fetchURL(wg *sync.WaitGroup, jobs <-chan Job, channel chan Result) {
+func fetchURL(wg *sync.WaitGroup, jobs <-chan Job, channel chan Result, ctx context.Context) {
 	defer wg.Done() //vai diminuir o contador do waitGroup quando a funçao terminar
 
 	//url para testar log de timeout https://httpbin.org/delay/5
 	client := http.Client{
-		Timeout: 2 * time.Second,
+		Timeout: 5 * time.Second,
 	}
+
 	for job := range jobs {
-		start := time.Now()              //tempo agora
-		resp, err := client.Get(job.URL) //requisicao get
+		if err := ctx.Err(); err != nil {
+			reason := "Global timeout exceeded"
+			if errors.Is(err, context.Canceled) {
+				reason = "Stopped by User (Ctrl+C)"
+			}
+			channel <- Result{URL: job.URL, Status: reason}
+			break
+		}
+		start := time.Now()                                                       //tempo agora
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, job.URL, nil) //requisicao get
 		if err != nil {
-			if netErr, ok := errors.AsType[net.Error](err); ok {
-				if netErr.Timeout() {
-					fmt.Println("Network error: the request timed out")
-				} else {
-					fmt.Println("Network error: General network/connectivity failure")
-				}
+			channel <- Result{URL: job.URL, Status: "Error creating request"}
+			continue
+		}
+
+		resp, err := client.Do(req) //client executa a requisiçao com o timeout global implementado
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				channel <- Result{URL: job.URL, Status: "Stopped by User (Ctrl + C)"}
+				continue
+			}
+			reason := "Error: " + err.Error()
+			if netErr, ok := errors.AsType[net.Error](err); ok && netErr.Timeout() {
+				reason = "Error: the request timed out"
 			}
 			if dnsErr, ok := errors.AsType[*net.DNSError](err); ok {
-				fmt.Println("Network error: DNS failure", dnsErr)
+				reason = "Error: DNS failure - " + dnsErr.Error()
 			}
-			channel <- Result{Status: "Error", duration: time.Since(start)} //retorna erro no canal
+			channel <- Result{URL: job.URL, Status: reason, duration: time.Since(start)} //retorna erro no canal
 			continue
 		}
 
 		duration := time.Since(start)
-
-		if resp.StatusCode >= 400 {
-			switch resp.StatusCode {
-			case http.StatusNotFound:
-				fmt.Println("Bad status code: 404 - the requested URL was not found")
-			case http.StatusInternalServerError:
-				fmt.Println("Bad status code: 500 - Internal Server Error")
-			}
+		status := resp.Status
+		if resp.StatusCode == http.StatusNotFound {
+			status = "Bad status code: 404 - the requested URL was not found"
+		} else if resp.StatusCode == http.StatusInternalServerError {
+			status = "Bad status code: 500 - Internal Server Error"
 		}
-		channel <- Result{job.URL, resp.Status, duration} //retorna os resultados no canal
-		resp.Body.Close()                                 //fecha o response body
+		channel <- Result{job.URL, status, duration} //retorna os resultados no canal
+		resp.Body.Close()                            //fecha o response body
 	}
 }
 
@@ -107,9 +122,19 @@ func main() {
 	results := make(chan Result)      //criando canal para as goroutines executarem
 	var wg sync.WaitGroup             //criando o wait group
 
+	//criando contexto caso o usuário pressione Ctrl + C
+	ctxStop, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	//criando contexto para dicionar timeout global
+	ctx, cancel := context.WithTimeout(ctxStop, 30*time.Second)
+	defer cancel()
+
+	fmt.Println("Application started. Press Ctrl+C to exit.")
+
 	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)                       //incrementando o contador antes de chamar a goroutine
-		go fetchURL(&wg, jobs, results) //goroutine que manda o endereço de memoria do waitGroup e os canais para processar e receber a resposta
+		wg.Add(1)                            //incrementando o contador antes de chamar a goroutine
+		go fetchURL(&wg, jobs, results, ctx) //goroutine que manda o endereço de memoria do waitGroup e os canais para processar e receber a resposta
 	}
 
 	for _, url := range urls {
@@ -128,6 +153,16 @@ func main() {
 
 	for result := range results {
 		fmt.Printf("\n%s finished in %s\n", result.URL, result.duration)
-		fmt.Println(result.Status, "\n")
+		fmt.Println(result.Status)
 	}
+
+	switch {
+	case ctxStop.Err() != nil:
+		fmt.Println("\n[!] Ctrl+C intercepted! Application stopped gracefully.")
+	case ctx.Err() == context.DeadlineExceeded:
+		fmt.Println("\n[!] Global timeout of 30s exceeded.")
+	default:
+		fmt.Println("\nAll URLs processed.")
+	}
+
 }
